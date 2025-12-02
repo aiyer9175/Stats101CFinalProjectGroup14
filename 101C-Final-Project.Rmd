@@ -1,0 +1,266 @@
+---
+title: "101C Final Project"
+author: "Lester Lee, Anirudh Iyer, Yinglin Wu, Stewart Fang"
+date: "2025-11-20"
+output: html_document
+---
+
+# read data
+```{r}
+library(data.table)
+library(catboost)
+library(caret)
+
+set.seed(2025)
+
+# Load data
+train <- fread("aluminum_coldRoll_train.csv")
+testNoY <- fread("aluminum_coldRoll_testNoY.csv")
+example <- fread("aluminum_coldRoll_example.csv")
+
+TARGET_COL <- "y_passXtremeDurability"
+y <- train[[TARGET_COL]]
+
+# Remove target from training features
+train[, (TARGET_COL) := NULL]
+
+# Combine train and test for consistent factor levels
+all_data <- rbind(train, testNoY, fill = TRUE)
+
+# Detect categorical columns and convert to factor
+cat_cols <- names(which(sapply(all_data, function(x)
+  is.character(x) || is.factor(x))))
+
+for (col in cat_cols) {
+  all_data[[col]] <- as.factor(all_data[[col]])
+}
+
+# Split back into train_x and test_x
+train_x <- all_data[1:nrow(train)]
+test_x  <- all_data[(nrow(train) + 1):nrow(all_data)]
+
+feature_names <- colnames(train_x)
+cat_idx <- which(feature_names %in% cat_cols)
+
+# Create 5-fold CV indices
+NFOLDS <- 5
+folds <- createFolds(y, k = NFOLDS, returnTrain = FALSE)
+```
+
+# define CV + logloss + catboost_cv_fun for OB (Can skip this part if not looking for best parameter)
+```{r}
+
+# logloss function
+logloss <- function(y_true, p_pred) {
+  p_pred <- pmin(pmax(p_pred, 1e-6), 1 - 1e-6)
+  -mean(y_true * log(p_pred) + (1 - y_true) * log(1 - p_pred))
+}
+
+catboost_cv_fun <- function(depth,
+                            learning_rate,
+                            l2_leaf_reg,
+                            bagging_temperature,
+                            border_count) {
+  depth            <- as.integer(round(depth))
+  border_count     <- as.integer(round(border_count))
+  l2_leaf_reg      <- as.numeric(l2_leaf_reg)
+  learning_rate    <- as.numeric(learning_rate)
+  bagging_temperature <- as.numeric(bagging_temperature)
+  
+  params <- list(
+    loss_function      = "Logloss",
+    eval_metric        = "Logloss",
+    iterations         = 2000,
+    learning_rate      = learning_rate,
+    depth              = depth,
+    l2_leaf_reg        = l2_leaf_reg,
+    random_strength    = 1,
+    bagging_temperature = bagging_temperature,
+    border_count       = border_count,
+    od_type            = "Iter",
+    od_wait            = 200,
+    use_best_model     = TRUE,
+    verbose            = 0
+  )
+  
+  oof_pred <- numeric(nrow(train_x))
+
+
+  for (f in 1:NFOLDS) {
+    val_idx <- folds[[f]]
+    tr_idx  <- setdiff(seq_along(y), val_idx)
+    
+    train_pool <- catboost.load_pool(
+      data = train_x[tr_idx, ..feature_names],
+      label = y[tr_idx],
+      cat_features = cat_idx  
+    )
+    
+    val_pool <- catboost.load_pool(
+      data = train_x[val_idx, ..feature_names],
+      label = y[val_idx],
+      cat_features = cat_idx
+    )
+    
+    model <- catboost.train(train_pool, val_pool, params = params)
+    
+    pred_val <- catboost.predict(model, val_pool, prediction_type = "Probability")
+    oof_pred[val_idx] <- pred_val
+}
+
+cv_ll <- logloss(y, oof_pred)
+  cat(sprintf("depth=%d, lr=%.4f, l2=%.3f, bag_temp=%.3f, border=%d -> CV LogLoss = %.6f\n",
+              depth, learning_rate, l2_leaf_reg, bagging_temperature, border_count, cv_ll))
+  
+  list(Score = -cv_ll, Pred = oof_pred)
+}
+```
+
+# find best parameters. Will take so long (8+ hours). Can skip this part.
+```{r}
+# Bayesian Optimization
+set.seed(2025)
+
+opt_res <- BayesianOptimization(
+  FUN = catboost_cv_fun,
+  bounds = list(
+    depth              = c(4L, 10L),
+    learning_rate      = c(0.01, 0.05),
+    l2_leaf_reg        = c(1.0, 15.0),
+    bagging_temperature = c(0.25, 3.0),
+    border_count       = c(32L, 254L)
+  ),
+  init_points = 8,  
+  n_iter      = 100, 
+  acq = "ucb",
+  kappa = 2.576,
+  eps = 0.0,
+  verbose = TRUE
+)
+
+opt_res$Best_Par      
+opt_res$Best_Value
+
+best_logloss <- -opt_res$Best_Value
+cat("Best CV logloss from BayesianOptimization:", best_logloss, "\n")
+print(opt_res$Best_Par)
+
+# Catboost parameter list
+best_params <- list(
+  loss_function      = "Logloss",
+  eval_metric        = "Logloss",
+  iterations         = 2000,
+  learning_rate      = opt_res$Best_Par["learning_rate"],
+  depth              = as.integer(round(opt_res$Best_Par["depth"])),
+  l2_leaf_reg        = opt_res$Best_Par["l2_leaf_reg"],
+  bagging_temperature = opt_res$Best_Par["bagging_temperature"],
+  random_strength    = 1,
+  border_count       = as.integer(round(opt_res$Best_Par["border_count"])),
+  od_type            = "Iter",
+  od_wait            = 200,
+  use_best_model     = TRUE,
+  verbose            = 100
+)
+
+cat("Best params:\n")
+print(best_params)
+
+```
+
+# Use best parameter to run catboost
+```{r}
+# Best parameters (BayesianOptimization result)
+best_params <- list(
+  loss_function      = "Logloss",
+  eval_metric        = "Logloss",
+  iterations         = 2000,
+  learning_rate      = 0.03489836,
+  depth              = 4.0000,
+  l2_leaf_reg        = 13.5725,
+  bagging_temperature = 2.525713,
+  random_strength = 2.0063912702369424,
+  border_count       = 39.0000,
+  od_type            = "Iter",
+  od_wait            = 200,
+  use_best_model     = TRUE,
+  verbose            = 100
+)
+
+# depth = 4.0000	learning_rate = 0.03489836	l2_leaf_reg = 13.5725	bagging_temperature = 2.525713	border_count = 39.0000	Value = -0.4234226 
+
+
+clip <- function(p) pmin(pmax(p, 1e-15), 1 - 1e-15)
+
+# Prepare OOF and test prediction containers
+oof_pred <- rep(NA_real_, length(y))
+test_pred_mat <- matrix(NA_real_, nrow = nrow(test_x), ncol = NFOLDS)
+
+# Build test pool once
+test_pool <- catboost.load_pool(
+  data = test_x[, ..feature_names],
+  cat_features = cat_idx
+)
+
+# 5-fold CV training
+for (k in seq_len(NFOLDS)) {
+  cat("\nFold", k, "/", NFOLDS, "\n")
+  
+  val_idx <- folds[[k]]
+  tr_idx <- setdiff(seq_along(y), val_idx)
+  
+  train_pool <- catboost.load_pool(
+    data = train_x[tr_idx, ..feature_names],
+    label = y[tr_idx],
+    cat_features = cat_idx
+  )
+  
+  val_pool <- catboost.load_pool(
+    data = train_x[val_idx, ..feature_names],
+    label = y[val_idx],
+    cat_features = cat_idx
+  )
+  
+  model_k <- catboost.train(
+    learn_pool = train_pool,
+    test_pool = val_pool,
+    params = best_params
+  )
+  
+  # Store OOF predictions
+  oof_pred[val_idx] <- catboost.predict(
+    model_k,
+    val_pool,
+    prediction_type = "Probability"
+  )
+  
+  # Store test predictions for this fold
+  test_pred_mat[, k] <- catboost.predict(
+    model_k,
+    test_pool,
+    prediction_type = "Probability"
+  )
+}
+
+# Compute CV logloss
+p_oof <- clip(oof_pred)
+cv_logloss <- -mean(y * log(p_oof) + (1 - y) * log(1 - p_oof))
+cat("\nFinal 5-fold CV LogLoss:", cv_logloss, "\n")
+
+# Average test preds across folds
+test_pred <- clip(rowMeans(test_pred_mat))
+
+cat("\nTest prediction summary:\n")
+print(summary(test_pred))
+
+# Create submission
+submission <- data.table(
+  ID = example$ID,
+  y_passXtremeDurability = test_pred
+)
+
+outfile <- "TEAM_14_catboost.csv"
+fwrite(submission, outfile)
+
+cat("\nSubmission saved to:", outfile, "\n")
+
+```
